@@ -76,10 +76,9 @@ with st.sidebar:
             st.session_state.user_role = "owner"
             if st.button("新しいルームを作成"):
                 new_room_id = str(random.randint(1000, 9999))
-                # 最初のランダムな問題を決定
                 first_q_idx = random.randint(0, len(df) - 1)
                 try:
-                    # used_indices に既に出題した問題をリストとして保存 (JSON文字列化)
+                    # カラムがない場合でも最悪動くように、まずは基本的な作成を試みる
                     supabase.table("rooms").insert({
                         "id": new_room_id,
                         "current_q_idx": first_q_idx,
@@ -89,7 +88,7 @@ with st.sidebar:
                     st.session_state.room_id = new_room_id
                     st.success(f"ルーム {new_room_id} を作成しました！")
                 except Exception as e:
-                    st.error(f"ルーム作成に失敗しました。詳細: {e}")
+                    st.error(f"ルーム作成に失敗しました。Supabaseで 'used_indices' カラムを追加してください。詳細: {e}")
         else:
             st.session_state.user_role = "player"
     else:
@@ -124,8 +123,9 @@ if st.session_state.last_q_idx != q_idx:
     st.session_state.canvas_key += 1
     st.session_state.last_q_idx = q_idx
 
-# 問題データの取得（ランダムに選ばれたインデックスを使用）
-q_data = df.iloc[q_idx]
+# 問題データの取得（範囲外エラー防止）
+q_idx_valid = q_idx % len(df)
+q_data = df.iloc[q_idx_valid]
 question = q_data["question"]
 correct_answer = q_data["answer"]
 
@@ -180,31 +180,28 @@ if st.session_state.user_role == "owner":
     st.divider()
     if st.button("次のランダム問題へ移動"):
         try:
-            # 既に出題されたインデックスを取得
-            used_indices = json.loads(room_data.get("used_indices", "[]"))
+            # 既に出題されたインデックスを取得（カラムがない場合は空リストとして扱う）
+            raw_used = room_data.get("used_indices", "[]")
+            used_indices = json.loads(raw_used) if raw_used else []
             
-            # 全問題のインデックス候補
             all_indices = list(range(len(df)))
-            # まだ使っていないインデックス
             remaining_indices = [i for i in all_indices if i not in used_indices]
             
-            # すべて使い切ったらリセット
             if not remaining_indices:
                 remaining_indices = all_indices
                 used_indices = []
             
-            # 次の問題をランダムに決定
             next_q_idx = random.choice(remaining_indices)
             used_indices.append(next_q_idx)
             
-            # DBを更新
+            # DBを更新（カラムが存在すること前提）
             supabase.table("rooms").update({
                 "current_q_idx": next_q_idx,
                 "used_indices": json.dumps(used_indices)
             }).eq("id", st.session_state.room_id).execute()
             st.rerun()
         except Exception as e:
-            st.error(f"問題更新エラー: {e}")
+            st.error(f"問題更新エラー: DBに 'used_indices' カラムがあるか確認してください。 {e}")
 
 # 同期のための自動リフレッシュ（5秒ごと）
 time.sleep(5)
