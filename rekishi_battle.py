@@ -66,7 +66,7 @@ if "canvas_key" not in st.session_state: st.session_state.canvas_key = 0
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
-    st.title("🎮 対戦コントロール")
+    st.title("🎮 对戦コントロール")
     st.write(f"あなたのID: **{st.session_state.user_id}**")
     
     mode = st.radio("役割を選択", ["プレイヤー", "オーナー"])
@@ -138,19 +138,28 @@ if st.button("回答を送信", type="primary", use_container_width=True):
     if canvas_result.image_data is not None:
         with st.spinner("AIが採点中..."):
             try:
-                img = Image.fromarray(canvas_result.image_data.astype('uint8'))
-                prompt = f"問題: {question}, 正解: {correct_answer}. 画像の手書き文字が正解なら'正解'、違うなら'不正解'と判定してください。"
-                ai_res = genai_client.models.generate_content(model='gemini-2.0-flash', contents=[img, prompt])
+                # 透過部分(RGBA)をRGBに変換して真っ黒になるのを防ぐ
+                raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
+                img = Image.new("RGB", raw_img.size, (255, 255, 255))
+                img.paste(raw_img, mask=raw_img.split()[3]) # アルファチャンネルをマスクに指定
+                
+                prompt = f"歴史問題: {question}\n正解の漢字: {correct_answer}\n\n画像にはユーザーが手書きした文字が映っています。これが正解の漢字として合っているか厳格に判定してください。正解の場合は「正解」という単語を必ず含めて回答してください。違っている場合はその理由を簡潔に教えてください。"
+                
+                # 最新の推奨モデル gemini-2.5-flash に最適化
+                ai_res = genai_client.models.generate_content(
+                    model='gemini-2.5-flash', 
+                    contents=[img, prompt]
+                )
                 
                 if "正解" in ai_res.text:
-                    st.success("正解です！")
+                    st.success("🎉 正解です！")
                     supabase.table("answers").insert({
                         "room_id": st.session_state.room_id,
                         "user_id": st.session_state.user_id,
                         "question_idx": q_idx
                     }).execute()
                 else:
-                    st.error(f"不正解です (AI判定: {ai_res.text})")
+                    st.error(f"❌ 不正解です\n\nAIの判定理由: {ai_res.text}")
             except Exception as e:
                 st.error(f"AIまたはDB送信エラー: {e}")
 
@@ -173,6 +182,6 @@ if st.session_state.user_role == "owner":
         except Exception as e:
             st.error(f"問題更新エラー: {e}")
 
-# 同期のための自動リフレッシュ
+# 同期のための自動リフレッシュ（5秒ごと）
 time.sleep(5)
 st.rerun()
