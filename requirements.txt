@@ -1,0 +1,6 @@
+streamlit
+streamlit-drawable-canvas
+pandas
+pillow
+google-genai
+supabase
