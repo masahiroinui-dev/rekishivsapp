@@ -5,6 +5,7 @@ from PIL import Image
 import random
 import os
 import time
+import json
 from google import genai
 from supabase import create_client, Client
 
@@ -40,12 +41,11 @@ st.markdown("""
 def load_data():
     csv_file = "rekishi_questions.xlsx - Sheet1.csv"
     if os.path.exists(csv_file):
-        # 日本語CSVでよく使われるエンコーディングを順に試す
         encodings = ['utf-8', 'cp932', 'shift_jis']
         for enc in encodings:
             try:
                 df = pd.read_csv(csv_file, header=None, names=["question", "answer"], encoding=enc)
-                return df.dropna()
+                return df.dropna().reset_index(drop=True)
             except UnicodeDecodeError:
                 continue
             except Exception as e:
@@ -66,7 +66,7 @@ if "canvas_key" not in st.session_state: st.session_state.canvas_key = 0
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
-    st.title("🎮 对戦コントロール")
+    st.title("🎮 対戦コントロール")
     st.write(f"あなたのID: **{st.session_state.user_id}**")
     
     mode = st.radio("役割を選択", ["プレイヤー", "オーナー"])
@@ -76,10 +76,14 @@ with st.sidebar:
             st.session_state.user_role = "owner"
             if st.button("新しいルームを作成"):
                 new_room_id = str(random.randint(1000, 9999))
+                # 最初のランダムな問題を決定
+                first_q_idx = random.randint(0, len(df) - 1)
                 try:
+                    # used_indices に既に出題した問題をリストとして保存 (JSON文字列化)
                     supabase.table("rooms").insert({
                         "id": new_room_id,
-                        "current_q_idx": 0,
+                        "current_q_idx": first_q_idx,
+                        "used_indices": json.dumps([first_q_idx]),
                         "is_active": True
                     }).execute()
                     st.session_state.room_id = new_room_id
@@ -111,7 +115,7 @@ except Exception as e:
     st.stop()
 
 # データの安全な抽出
-q_idx = room_data.get("current_q_idx", 0) if room_data else 0
+q_idx = room_data.get("current_q_idx", 0)
 
 # 問題が切り替わった時にキャンバスをリセットするための処理
 if "last_q_idx" not in st.session_state:
@@ -120,11 +124,12 @@ if st.session_state.last_q_idx != q_idx:
     st.session_state.canvas_key += 1
     st.session_state.last_q_idx = q_idx
 
-q_data = df.iloc[q_idx % len(df)]
+# 問題データの取得（ランダムに選ばれたインデックスを使用）
+q_data = df.iloc[q_idx]
 question = q_data["question"]
 correct_answer = q_data["answer"]
 
-st.markdown(f"<div class='status-box'>ルーム: {st.session_state.room_id} | 第 {q_idx + 1} 問</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='status-box'>ルーム: {st.session_state.room_id} | 出題中</div>", unsafe_allow_html=True)
 st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow_html=True)
 
 # 手書きキャンバス
@@ -138,14 +143,12 @@ if st.button("回答を送信", type="primary", use_container_width=True):
     if canvas_result.image_data is not None:
         with st.spinner("AIが採点中..."):
             try:
-                # 透過部分(RGBA)をRGBに変換して真っ黒になるのを防ぐ
                 raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
                 img = Image.new("RGB", raw_img.size, (255, 255, 255))
-                img.paste(raw_img, mask=raw_img.split()[3]) # アルファチャンネルをマスクに指定
+                img.paste(raw_img, mask=raw_img.split()[3])
                 
                 prompt = f"歴史問題: {question}\n正解の漢字: {correct_answer}\n\n画像にはユーザーが手書きした文字が映っています。これが正解の漢字として合っているか厳格に判定してください。正解の場合は「正解」という単語を必ず含めて回答してください。違っている場合はその理由を簡潔に教えてください。"
                 
-                # 最新の推奨モデル gemini-2.5-flash に最適化
                 ai_res = genai_client.models.generate_content(
                     model='gemini-2.5-flash', 
                     contents=[img, prompt]
@@ -172,12 +175,33 @@ try:
 except:
     pass
 
-# オーナー操作
+# オーナー操作：ランダム出題ロジック
 if st.session_state.user_role == "owner":
     st.divider()
-    if st.button("次の問題へ移動"):
+    if st.button("次のランダム問題へ移動"):
         try:
-            supabase.table("rooms").update({"current_q_idx": q_idx + 1}).eq("id", st.session_state.room_id).execute()
+            # 既に出題されたインデックスを取得
+            used_indices = json.loads(room_data.get("used_indices", "[]"))
+            
+            # 全問題のインデックス候補
+            all_indices = list(range(len(df)))
+            # まだ使っていないインデックス
+            remaining_indices = [i for i in all_indices if i not in used_indices]
+            
+            # すべて使い切ったらリセット
+            if not remaining_indices:
+                remaining_indices = all_indices
+                used_indices = []
+            
+            # 次の問題をランダムに決定
+            next_q_idx = random.choice(remaining_indices)
+            used_indices.append(next_q_idx)
+            
+            # DBを更新
+            supabase.table("rooms").update({
+                "current_q_idx": next_q_idx,
+                "used_indices": json.dumps(used_indices)
+            }).eq("id", st.session_state.room_id).execute()
             st.rerun()
         except Exception as e:
             st.error(f"問題更新エラー: {e}")
