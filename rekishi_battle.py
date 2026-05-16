@@ -14,7 +14,7 @@ st.set_page_config(page_title="歴史・手書きリアルタイム対戦", layo
 
 # --- 2. API & データベース初期化 ---
 try:
-    # Gemini API (最新の安定版 2.0 Flash を使用)
+    # Gemini API
     genai_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     
     # Supabase (Secretsに SUPABASE_URL と SUPABASE_KEY を設定)
@@ -145,22 +145,42 @@ if st.button("回答を送信", type="primary", use_container_width=True):
                 img = Image.new("RGB", raw_img.size, (255, 255, 255))
                 img.paste(raw_img, mask=raw_img.split()[3])
                 
-                # モデル名を安定版の gemini-2.0-flash に変更
                 prompt = f"問題: {question}, 正解: {correct_answer}. 画像の手書き文字が正解なら'正解'、違うなら'不正解'と判定してください。判定は厳しめに行ってください。"
-                ai_res = genai_client.models.generate_content(model='gemini-2.0-flash', contents=[img, prompt])
                 
-                if "正解" in ai_res.text:
-                    st.success("正解です！")
-                    supabase.table("answers").insert({
-                        "room_id": st.session_state.room_id,
-                        "user_id": st.session_state.user_id,
-                        "question_idx": q_idx
-                    }).execute()
+                # レートリミット対策: モデルを順に試す
+                models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash']
+                ai_res = None
+                last_error = ""
+
+                for model_name in models_to_try:
+                    try:
+                        ai_res = genai_client.models.generate_content(model=model_name, contents=[img, prompt])
+                        if ai_res: break
+                    except Exception as e:
+                        last_error = str(e)
+                        if "429" in last_error:
+                            continue # 次のモデルを試す
+                        else:
+                            raise e
+
+                if ai_res:
+                    if "正解" in ai_res.text:
+                        st.success("正解です！")
+                        supabase.table("answers").insert({
+                            "room_id": st.session_state.room_id,
+                            "user_id": st.session_state.user_id,
+                            "question_idx": q_idx
+                        }).execute()
+                    else:
+                        st.error(f"不正解です (AI判定: {ai_res.text})")
                 else:
-                    st.error(f"不正解です (AI判定: {ai_res.text})")
+                    st.error(f"AIの利用制限に達しました。少し時間を置いて再試行してください。\n(Error: {last_error})")
+
             except Exception as e:
-                st.error(f"採点エラー: {e}")
-                st.info("モデル名が古い、またはAPIキーの権限エラーの可能性があります。")
+                if "429" in str(e):
+                    st.error("🚀 AIが混み合っています。30秒ほど待ってから再度「回答を送信」を押してください。")
+                else:
+                    st.error(f"採点エラー: {e}")
 
 # 勝者表示
 try:
