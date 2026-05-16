@@ -1,0 +1,171 @@
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+import pandas as pd
+from PIL import Image
+import random
+import os
+import time
+from google import genai
+from supabase import create_client, Client
+
+# --- 1. アプリの基本設定 ---
+st.set_page_config(page_title="歴史・手書きリアルタイム対戦", layout="centered")
+
+# --- 2. API & データベース初期化 ---
+# これらの値は Streamlit の Secrets から読み込みます
+try:
+    # Gemini API
+    genai_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    
+    # Supabase (Secretsに SUPABASE_URL と SUPABASE_KEY を設定)
+    url: str = st.secrets["SUPABASE_URL"]
+    key: str = st.secrets["SUPABASE_KEY"]
+    supabase: Client = create_client(url, key)
+except Exception as e:
+    st.error(f"設定エラー: {e}")
+    st.info("StreamlitのSecretsに GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY が正しく設定されているか確認してください。")
+    st.stop()
+
+# --- 3. デザイン（CSS） ---
+st.markdown("""
+    <style>
+    .stCanvasContainer { border: 3px solid #4a4a4a; border-radius: 12px; }
+    .status-box { padding: 10px; border-radius: 8px; margin-bottom: 15px; text-align: center; font-weight: bold; background-color: #f0f2f6; border: 1px solid #d1d5db; }
+    .winner-announcement { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 10px; text-align: center; font-size: 1.5rem; margin-top: 10px; border: 2px solid #ffeeba; }
+    .question-display { font-size: 1.4rem; font-weight: bold; color: #1e3a8a; padding: 15px; background: #eff6ff; border-radius: 10px; margin-bottom: 20px; border-left: 5px solid #3b82f6; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 4. データ読み込み（既存のCSVを使用） ---
+@st.cache_data
+def load_data():
+    csv_file = "rekishi_questions.xlsx - Sheet1.csv"
+    if os.path.exists(csv_file):
+        try:
+            df = pd.read_csv(csv_file, header=None, names=["question", "answer"])
+            return df.dropna()
+        except Exception as e:
+            st.error(f"CSV読み込みエラー: {e}")
+    return pd.DataFrame({"question": ["問題データがありません"], "answer": ["エラー"]})
+
+df = load_data()
+
+# --- 5. セッション状態の初期化 ---
+if "user_id" not in st.session_state: st.session_state.user_id = f"User_{random.randint(100, 999)}"
+if "room_id" not in st.session_state: st.session_state.room_id = ""
+if "user_role" not in st.session_state: st.session_state.user_role = "player"
+if "canvas_key" not in st.session_state: st.session_state.canvas_key = 0
+
+# --- 6. サイドバー：入室・ルーム管理 ---
+with st.sidebar:
+    st.title("🎮 対戦コントロール")
+    st.write(f"あなたのID: **{st.session_state.user_id}**")
+    
+    mode = st.radio("役割を選択", ["プレイヤー", "オーナー"])
+    if mode == "オーナー":
+        pw = st.text_input("管理者パスワード", type="password")
+        if pw == st.secrets.get("ADMIN_PASSWORD", "admin123"):
+            st.session_state.user_role = "owner"
+            if st.button("新しいルームを作成"):
+                new_room = str(random.randint(1000, 9999))
+                try:
+                    # Supabaseに部屋レコードを作成
+                    supabase.table("rooms").insert({
+                        "id": new_room,
+                        "current_q_idx": 0,
+                        "is_active": True
+                    }).execute()
+                    st.session_state.room_id = new_room
+                    st.success(f"ルーム {new_room} を作成しました！")
+                except Exception as e:
+                    st.error(f"ルーム作成失敗: {e}")
+        else:
+            st.session_state.user_role = "player"
+    else:
+        st.session_state.user_role = "player"
+        st.session_state.room_id = st.text_input("部屋番号を入力", value=st.session_state.room_id)
+
+# --- 7. メイン対戦ロジック ---
+if not st.session_state.room_id:
+    st.info("👋 サイドバーから部屋を作成するか、部屋番号を入力して対戦を開始してください。")
+    st.stop()
+
+# リアルタイム同期: 部屋の現在の状態をSupabaseから取得
+try:
+    response = supabase.table("rooms").select("*").eq("id", st.session_state.room_id).execute()
+    if not response.data:
+        st.error(f"部屋 {st.session_state.room_id} が見つかりません。")
+        st.stop()
+    room_data = response.data[0]
+except Exception as e:
+    st.error(f"データ取得エラー: {e}")
+    st.stop()
+
+q_idx = room_data.get("current_q_idx", 0)
+q_data = df.iloc[q_idx % len(df)]
+question = q_data["question"]
+correct_answer = q_data["answer"]
+
+st.markdown(f"<div class='status-box'>ルーム: {st.session_state.room_id} | 第 {q_idx + 1} 問</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow_html=True)
+
+# 手書きキャンバス
+canvas_result = st_canvas(
+    stroke_width=6, stroke_color="#000000", background_color="#ffffff",
+    height=250, width=700, key=f"canvas_{st.session_state.room_id}_{q_idx}_{st.session_state.canvas_key}"
+)
+
+# 回答送信ボタン
+if st.button("回答を送信", type="primary", use_container_width=True):
+    if canvas_result.image_data is not None:
+        with st.spinner("AIがあなたの手書き文字を採点中..."):
+            try:
+                img = Image.fromarray(canvas_result.image_data.astype('uint8'))
+                # Gemini Visionへのプロンプト
+                prompt = f"""
+                歴史クイズの問題: {question}
+                正解は: {correct_answer}
+                画像に手書きされた文字を読み取り、正解と一致するか判定してください。
+                多少の字の崩れや文脈から正解と判断できる場合は「正解」とだけ返してください。
+                それ以外は「不正解」と返してください。
+                """
+                
+                response = genai_client.models.generate_content(model='gemini-2.0-flash', contents=[img, prompt])
+                
+                if "正解" in response.text:
+                    st.success("正解です！")
+                    # 正解データをSupabaseに送信して記録
+                    supabase.table("answers").insert({
+                        "room_id": st.session_state.room_id,
+                        "user_id": st.session_state.user_id,
+                        "question_idx": q_idx
+                    }).execute()
+                else:
+                    st.error(f"残念、もう一度！ (判定: {response.text})")
+            except Exception as e:
+                st.error(f"AI採点中にエラーが発生しました: {e}")
+
+# 勝者発表
+try:
+    winners_res = supabase.table("answers").select("user_id").eq("room_id", st.session_state.room_id).eq("question_idx", q_idx).execute()
+    if winners_res.data:
+        first_winner = winners_res.data[0]["user_id"]
+        st.markdown(f"<div class='winner-announcement'>🏆 この問題の勝者: {first_winner} さん！</div>", unsafe_allow_html=True)
+except Exception as e:
+    # 勝者がまだいない場合は無視
+    pass
+
+# オーナー専用コントロール
+if st.session_state.user_role == "owner":
+    st.divider()
+    st.subheader("👑 オーナー専用操作")
+    if st.button("次の問題へ移動"):
+        try:
+            supabase.table("rooms").update({"current_q_idx": q_idx + 1}).eq("id", st.session_state.room_id).execute()
+            st.rerun()
+        except Exception as e:
+            st.error(f"更新エラー: {e}")
+
+# 自動更新
+time.sleep(3)
+st.rerun()
