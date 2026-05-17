@@ -7,6 +7,7 @@ import os
 import time
 import json
 from google import genai
+from google.genai import errors
 from supabase import create_client, Client
 
 # --- 1. アプリの基本設定 ---
@@ -17,13 +18,12 @@ try:
     # Gemini API
     genai_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     
-    # Supabase (Secretsに SUPABASE_URL と SUPABASE_KEY を設定)
+    # Supabase
     url: str = st.secrets["SUPABASE_URL"]
     key: str = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except Exception as e:
     st.error(f"⚠️ 接続設定エラー: {e}")
-    st.info("StreamlitのSecrets設定を確認してください（GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY）")
     st.stop()
 
 # --- 3. デザイン（CSS） ---
@@ -41,7 +41,6 @@ st.markdown("""
 def load_data():
     csv_file = "rekishi_questions.xlsx - Sheet1.csv"
     if os.path.exists(csv_file):
-        # 日本語CSVでよく使われるエンコーディングを順に試す
         encodings = ['utf-8', 'cp932', 'shift_jis']
         for enc in encodings:
             try:
@@ -49,13 +48,7 @@ def load_data():
                 return df.dropna().reset_index(drop=True)
             except UnicodeDecodeError:
                 continue
-            except Exception as e:
-                st.error(f"読み込みエラー ({enc}): {e}")
-                
-    return pd.DataFrame({
-        "question": ["魏志倭人伝の『魏』を書けますか？", "聖徳太子が送った使節（漢字1文字）"],
-        "answer": ["魏", "隋"]
-    })
+    return pd.DataFrame({"question": ["魏志倭人伝の『魏』は？"], "answer": ["魏"]})
 
 df = load_data()
 
@@ -65,142 +58,92 @@ if "room_id" not in st.session_state: st.session_state.room_id = ""
 if "user_role" not in st.session_state: st.session_state.user_role = "player"
 if "canvas_key" not in st.session_state: st.session_state.canvas_key = 0
 
-# --- 6. サイドバー：入室・ルーム管理 ---
+# --- 6. サイドバー ---
 with st.sidebar:
     st.title("🎮 対戦コントロール")
-    st.write(f"あなたのID: **{st.session_state.user_id}**")
-    
     mode = st.radio("役割を選択", ["プレイヤー", "オーナー"])
     if mode == "オーナー":
         pw = st.text_input("管理者パスワード", type="password")
         if pw == st.secrets.get("ADMIN_PASSWORD", "admin123"):
             st.session_state.user_role = "owner"
             if st.button("新しいルームを作成"):
-                new_room_id = str(random.randint(1000, 9999))
-                try:
-                    supabase.table("rooms").insert({
-                        "id": new_room_id,
-                        "current_q_idx": 0,
-                        "used_indices": json.dumps([0]),
-                        "is_active": True
-                    }).execute()
-                    st.session_state.room_id = new_room_id
-                    st.success(f"ルーム {new_room_id} を作成しました！")
-                except Exception as e:
-                    st.error(f"ルーム作成に失敗しました。詳細: {e}")
-        else:
-            st.session_state.user_role = "player"
+                new_id = str(random.randint(1000, 9999))
+                supabase.table("rooms").insert({"id": new_id, "current_q_idx": 0, "is_active": True}).execute()
+                st.session_state.room_id = new_id
     else:
         st.session_state.user_role = "player"
         st.session_state.room_id = st.text_input("部屋番号を入力", value=st.session_state.room_id)
 
-# --- 7. メイン対戦ロジック ---
+# --- 7. メインロジック ---
 if not st.session_state.room_id:
-    st.info("👋 サイドバーから部屋を作成するか、部屋番号を入力して対戦を開始してください。")
+    st.info("👋 サイドバーから開始してください。")
     st.stop()
 
-# リアルタイム同期: 部屋の状態を取得
-room_data = None
+# 部屋の状態取得
 try:
-    response = supabase.table("rooms").select("*").eq("id", st.session_state.room_id).execute()
-    if hasattr(response, 'data') and response.data and len(response.data) > 0:
-        room_data = response.data[0]
-    else:
-        st.warning(f"部屋 {st.session_state.room_id} は存在しないか、読み込めません。")
-        st.stop()
-except Exception as e:
-    st.error(f"データベース接続エラー: {e}")
+    res = supabase.table("rooms").select("*").eq("id", st.session_state.room_id).execute()
+    room_data = res.data[0] if res.data else None
+    if not room_data: st.stop()
+except:
     st.stop()
 
-# データの安全な抽出
-q_idx = room_data.get("current_q_idx", 0) if room_data else 0
-
-# 問題が切り替わった時にキャンバスをリセットするための処理
-if "last_q_idx" not in st.session_state:
-    st.session_state.last_q_idx = q_idx
-if st.session_state.last_q_idx != q_idx:
-    st.session_state.canvas_key += 1
-    st.session_state.last_q_idx = q_idx
-
+q_idx = room_data.get("current_q_idx", 0)
 q_data = df.iloc[q_idx % len(df)]
 question = q_data["question"]
 correct_answer = q_data["answer"]
 
-st.markdown(f"<div class='status-box'>ルーム: {st.session_state.room_id} | 第 {q_idx + 1} 問</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='status-box'>第 {q_idx + 1} 問</div>", unsafe_allow_html=True)
 st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow_html=True)
 
-# 手書きキャンバス
 canvas_result = st_canvas(
     stroke_width=6, stroke_color="#000000", background_color="#ffffff",
-    height=250, width=700, key=f"canvas_{st.session_state.room_id}_{q_idx}_{st.session_state.canvas_key}"
+    height=250, width=700, key=f"c_{st.session_state.room_id}_{q_idx}_{st.session_state.canvas_key}"
 )
 
-# 回答送信
 if st.button("回答を送信", type="primary", use_container_width=True):
     if canvas_result.image_data is not None:
         with st.spinner("AIが採点中..."):
             try:
-                # 画像の整形（RGBAからRGBへ。透明度を白背景に）
                 raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
                 img = Image.new("RGB", raw_img.size, (255, 255, 255))
                 img.paste(raw_img, mask=raw_img.split()[3])
                 
-                prompt = f"問題: {question}, 正解: {correct_answer}. 画像の手書き文字が正解なら'正解'、違うなら'不正解'と判定してください。判定は厳しめに行ってください。"
+                # 最も制限が緩い 1.5-flash-8b を優先使用
+                prompt = f"問題: {question}, 正解: {correct_answer}. 画像の手書き文字が正解か判定し、'正解'か'不正解'のどちらかの単語のみ出力してください。"
                 
-                # レートリミット対策: モデルを順に試す
-                models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash']
-                ai_res = None
-                last_error = ""
-
-                for model_name in models_to_try:
+                # 強力なリトライロジック
+                success = False
+                for model_name in ['gemini-1.5-flash-8b', 'gemini-1.5-flash']:
                     try:
                         ai_res = genai_client.models.generate_content(model=model_name, contents=[img, prompt])
-                        if ai_res: break
-                    except Exception as e:
-                        last_error = str(e)
-                        if "429" in last_error:
-                            continue # 次のモデルを試す
+                        if "正解" in ai_res.text:
+                            st.success("正解です！")
+                            supabase.table("answers").insert({"room_id": st.session_state.room_id, "user_id": st.session_state.user_id, "question_idx": q_idx}).execute()
                         else:
-                            raise e
-
-                if ai_res:
-                    if "正解" in ai_res.text:
-                        st.success("正解です！")
-                        supabase.table("answers").insert({
-                            "room_id": st.session_state.room_id,
-                            "user_id": st.session_state.user_id,
-                            "question_idx": q_idx
-                        }).execute()
-                    else:
-                        st.error(f"不正解です (AI判定: {ai_res.text})")
-                else:
-                    st.error(f"AIの利用制限に達しました。少し時間を置いて再試行してください。\n(Error: {last_error})")
+                            st.error(f"不正解です (判定: {ai_res.text})")
+                        success = True
+                        break
+                    except Exception as e:
+                        if "429" in str(e): continue
+                        else: raise e
+                
+                if not success:
+                    st.warning("現在AIが大変混み合っています。Google側の無料枠制限のため、1分ほど空けてから再度お試しください。")
 
             except Exception as e:
-                if "429" in str(e):
-                    st.error("🚀 AIが混み合っています。30秒ほど待ってから再度「回答を送信」を押してください。")
-                else:
-                    st.error(f"採点エラー: {e}")
+                st.error(f"エラーが発生しました。")
 
 # 勝者表示
 try:
     ans_res = supabase.table("answers").select("user_id").eq("room_id", st.session_state.room_id).eq("question_idx", q_idx).order("solved_at", descending=False).execute()
-    if hasattr(ans_res, 'data') and ans_res.data:
-        winner = ans_res.data[0]["user_id"]
-        st.markdown(f"<div class='winner-announcement'>🏆 この問題の勝者: {winner} さん！</div>", unsafe_allow_html=True)
-except:
-    pass
+    if ans_res.data:
+        st.markdown(f"<div class='winner-announcement'>🏆 勝者: {ans_res.data[0]['user_id']} さん！</div>", unsafe_allow_html=True)
+except: pass
 
-# オーナー操作
 if st.session_state.user_role == "owner":
-    st.divider()
-    if st.button("次の問題へ移動"):
-        try:
-            supabase.table("rooms").update({"current_q_idx": q_idx + 1}).eq("id", st.session_state.room_id).execute()
-            st.rerun()
-        except Exception as e:
-            st.error(f"問題更新エラー: {e}")
+    if st.button("次の問題へ"):
+        supabase.table("rooms").update({"current_q_idx": q_idx + 1}).eq("id", st.session_state.room_id).execute()
+        st.rerun()
 
-# 同期のための自動リフレッシュ
 time.sleep(5)
 st.rerun()
