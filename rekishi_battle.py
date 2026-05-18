@@ -71,7 +71,7 @@ if "canvas_key" not in st.session_state:
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
-    st.title("🎮 対戦コントロール")
+    st.title("🎮 对戦コントロール")
     st.session_state.user_id = st.text_input("あなたの名前（ID）", value=st.session_state.user_id, help="対戦結果に表示される名前です")
     
     st.divider()
@@ -155,7 +155,6 @@ rank_data = []
 db_error_message = None
 try:
     # question_idx が INT8 型なので Python から渡す値を明示的に int にキャスト
-    # descending=False から desc=False に修正（エラー解消箇所）
     ans_res = supabase.table("answers")\
         .select("user_id, solved_at")\
         .eq("room_id", str(st.session_state.room_id))\
@@ -202,7 +201,10 @@ if st.session_state.user_role == "owner":
     # 2. 次の問題へ進めるコントロールパネル
     st.markdown("<div class='owner-section'>", unsafe_allow_html=True)
     st.subheader("⚙️ ルーム進行コントロール")
-    st.write(f"答え: **{correct_answer}**")
+    
+    # 💡 ネタバレ防止のため、答えをアコーディオンに格納して隠す
+    with st.expander("👁️ 正解（答え）を確認する"):
+        st.write(f"答え: **{correct_answer}**")
     
     if st.button("➡️ 正解者を確定して「次のランダム問題」へ移動する", type="primary", use_container_width=True):
         try:
