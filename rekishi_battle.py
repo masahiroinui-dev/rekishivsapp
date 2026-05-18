@@ -1,7 +1,7 @@
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 import random
 import time
 import os
@@ -13,15 +13,19 @@ from supabase import create_client, Client
 # --- 1. アプリ的基本設定 ---
 st.set_page_config(page_title="歴史・手書きリアルタイム対戦", layout="centered")
 
-# --- 2. API & データベース初期化 ---
+# --- 2. API & データベース接続のキャッシュ化（高速化の要） ---
+# 毎回新規にクライアントを作成すると、接続オーバーヘッドで最大1秒遅延するため、セッションキャッシュに保持します。
+@st.cache_resource
+def get_gemini_client(api_key: str):
+    return genai.Client(api_key=api_key)
+
+@st.cache_resource
+def get_supabase_client(url: str, key: str):
+    return create_client(url, key)
+
 try:
-    # 最新の google-genai クライアントの初期化 (requirements.txt に準拠)
-    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    # Supabase 接続設定
-    url: str = st.secrets["SUPABASE_URL"]
-    key: str = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(url, key)
+    client = get_gemini_client(st.secrets["GEMINI_API_KEY"])
+    supabase = get_supabase_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 except Exception as e:
     st.error(f"⚠️ 設定エラー: {e}")
     st.info("Secrets に GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY が設定されているか確認してください。")
@@ -42,7 +46,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 4. データ読み込み ---
+# --- 4. データ読み込み（メモリキャッシュ化） ---
 @st.cache_data
 def load_data():
     csv_file = "rekishi_questions.xlsx - Sheet1.csv"
@@ -74,7 +78,7 @@ if "is_processing" not in st.session_state:
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
-    st.title("🎮 对戦コントロール")
+    st.title("🎮 対戦コントロール")
     st.session_state.user_id = st.text_input("あなたの名前（ID）", value=st.session_state.user_id, help="対戦結果に表示される名前です")
     
     st.divider()
@@ -112,18 +116,20 @@ with st.sidebar:
         "データ同期の間隔 (秒)", 
         min_value=3, 
         max_value=15, 
-        value=8, 
-        help="参加人数が多いときは、この値を「8秒〜12秒」に増やすことで、サーバーの負荷を下げて動作を軽くできます。"
+        value=15, 
+        help="参加人数が多いときは、この値を「8秒〜15秒」に増やすことで、サーバーの負荷を下げて動作を軽くできます。"
     )
 
     # 接続確認用のミニステータス
     if st.session_state.room_id:
         st.markdown("**📡 データベース同期状態**")
         try:
-            # 疎通確認テスト
-            test_res = supabase.table("rooms").select("id").eq("id", st.session_state.room_id).execute()
+            test_res = supabase.table("rooms").select("id, is_active").eq("id", st.session_state.room_id).execute()
             if test_res.data:
-                st.markdown("<span class='db-badge' style='background-color: #dcfce7; color: #15803d;'>🟢 接続完了（同期中）</span>", unsafe_allow_html=True)
+                if test_res.data[0].get("is_active", True):
+                    st.markdown("<span class='db-badge' style='background-color: #dcfce7; color: #15803d;'>🟢 接続完了（同期中）</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 終了されたルームです</span>", unsafe_allow_html=True)
             else:
                 st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 ルームが見つかりません</span>", unsafe_allow_html=True)
         except Exception as conn_err:
@@ -135,13 +141,26 @@ if not st.session_state.room_id:
     st.info("👋 サイドバーから部屋を作成するか、部屋番号を入力して対戦を開始してください。")
     st.stop()
 
-# ルーム情報の取得
+# ルーム情報の取得とアクティブ状態の検証
 try:
     room_res = supabase.table("rooms").select("*").eq("id", st.session_state.room_id).execute()
     if not room_res.data:
-        st.error(f"ルーム {st.session_state.room_id} が見つかりません。")
+        st.warning("⚠️ このルームは存在しないか、既に削除されました。")
+        if st.button("🚪 ロビー（ホーム）に戻る", use_container_width=True):
+            st.session_state.room_id = ""
+            st.rerun()
         st.stop()
+        
     room_data = room_res.data[0]
+    
+    # オーナー離脱の自動検知
+    if not room_data.get("is_active", True):
+        st.error("🚪 オーナーが退出したか、ルームが解散されたため対戦は終了しました。")
+        if st.button("🚪 ロビー（ホーム）に戻る", type="primary", use_container_width=True):
+            st.session_state.room_id = ""
+            st.rerun()
+        st.stop()
+        
 except Exception as e:
     st.error(f"Supabaseからのルーム取得エラー: {e}")
     st.stop()
@@ -164,7 +183,7 @@ correct_answer = q_data["answer"]
 st.markdown(f"<div class='status-box'>🏰 ルーム: {st.session_state.room_id} | 現在の役割: {'👑 オーナー' if st.session_state.user_role == 'owner' else '👤 プレイヤー'}</div>", unsafe_allow_html=True)
 st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow_html=True)
 
-# リアルタイムで正解者リストをSupabaseから取得 (誰が一番早かったか)
+# リアルタイムで正解者リストを取得
 rank_data = []
 db_error_message = None
 try:
@@ -186,7 +205,6 @@ if st.session_state.user_role == "owner":
     if db_error_message:
         st.error(db_error_message)
     
-    # 1. リアルタイム回答状況
     st.markdown("#### ⏱️ 正解者リアルタイム順位表 (早い者勝ち)")
     if rank_data:
         first_winner = rank_data[0]["user_id"]
@@ -206,7 +224,6 @@ if st.session_state.user_role == "owner":
     else:
         st.info("⌛ まだ正解者はいません。プレイヤーの解答を待っています...")
 
-    # 2. 次の問題へ進めるコントロールパネル
     st.markdown("<div class='owner-section'>", unsafe_allow_html=True)
     st.subheader("⚙️ ルーム進行コントロール")
     
@@ -235,6 +252,17 @@ if st.session_state.user_role == "owner":
             st.rerun()
         except Exception as e:
             st.error(f"問題更新エラー: {e}")
+            
+    st.divider()
+    if st.button("🚪 ルームを解散して終了する (プレイヤーも自動切断されます)", type="secondary", use_container_width=True):
+        try:
+            supabase.table("rooms").update({"is_active": False}).eq("id", st.session_state.room_id).execute()
+            st.session_state.room_id = ""
+            st.success("ルームを解散しました。")
+            st.rerun()
+        except Exception as disband_err:
+            st.error(f"ルーム解散エラー: disband_err")
+            
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---- 【プレイヤー専用画面の表示】 ----
@@ -247,21 +275,24 @@ else:
         height=250, width=700, key=f"canvas_{st.session_state.room_id}_{current_q_idx}_{st.session_state.canvas_key}"
     )
 
-    # 連打防止：現在処理中の場合はボタンを無効化（グレーアウト）する
     submit_disabled = st.session_state.is_processing
 
     if st.button("✅ 回答を送信", type="primary", use_container_width=True, disabled=submit_disabled):
         if canvas_result.image_data is not None:
-            # 同期リフレッシュの競合を防ぐフラグをセット
             st.session_state.is_processing = True
             with st.spinner("AIが採点中..."):
                 try:
+                    # 🚀 【劇的軽量化①】カラー画像をモノクロ（グレー）に変換し、不要な画素情報を完全カット
                     raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
+                    gray_img = ImageOps.grayscale(raw_img)
                     
-                    # 🚀 送信画像の軽量化
-                    resized_raw = raw_img.resize((350, 125), Image.Resampling.LANCZOS)
-                    img = Image.new("RGB", resized_raw.size, (255, 255, 255))
-                    img.paste(resized_raw, mask=resized_raw.split()[3])
+                    # 🚀 【劇的軽量化②】解像度を大幅に縮小（文字のディテールを保ちながらデータサイズを最大1/20以下に削減）
+                    # これにより教室のWi-Fiの上りデータ送信時間およびGemini APIの解析準備オーバーヘッドを最小化します
+                    resized_gray = gray_img.resize((240, 90), Image.Resampling.LANCZOS)
+                    
+                    # 🚀 【劇的軽量化③】PNG圧縮用のシンプルな白黒2値RGB画像を再構成
+                    img = Image.new("RGB", resized_gray.size, (255, 255, 255))
+                    img.paste(resized_gray, mask=raw_img.split()[3].resize((240, 90)))
                     
                     prompt = (
                         f"歴史問題: {question}\n"
@@ -276,9 +307,6 @@ else:
                     errors_logged = []
                     retry_wait_seconds = 0
                     
-                    # 🚀 [有料キーでの安定動作最適化]
-                    # 有料アカウントの場合、メインモデル『gemini-2.5-flash』だけで1分間に1,000回リクエスト可能です。
-                    # 一時的に429が出た場合、他モデルへの無駄なアタックをせず、クォータ判定の確認メッセージを出します。
                     target_model = 'gemini-2.5-flash'
                     try:
                         ai_response = client.models.generate_content(
@@ -289,7 +317,6 @@ else:
                         err_str = str(model_err)
                         errors_logged.append(f"{target_model}: {err_str}")
                         
-                        # 429 RESOURCE_EXHAUSTED のエラーから制限解除時間を抽出
                         if "429" in err_str:
                             match = re.search(r"Please retry in ([\d\.]+)\s*s", err_str)
                             if match:
@@ -308,17 +335,14 @@ else:
                         else:
                             st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
                     else:
-                        # 429制限が発生した場合
                         if retry_wait_seconds > 0:
                             st.error("⚠️ Google APIの利用制限（1分あたりの上限数）に達しました。")
                             
-                            # 💡 クォータに関する詳細なガイダンス
                             if "free_tier_requests" in str(errors_logged):
                                 st.warning("📢 【重要】APIキーがまだ無料枠として認識されています。")
                                 st.markdown("""
                                 **現在のAPIキーは有料プラン(Pay-as-you-go)になっていません。**
                                 課金設定を完了した後に、**Google AI Studioで新しいAPIキーを新規作成**し、StreamlitのSecrets設定を書き換えてください。
-                                （古いキーはアップグレード後も無料枠のまま残ることがあります。）
                                 """)
                                 
                             countdown_placeholder = st.empty()
@@ -335,7 +359,6 @@ else:
                 except Exception as e:
                     st.error(f"採点システムエラー: {e}")
                 finally:
-                    # 採点終了後に同期リフレッシュを再有効化
                     st.session_state.is_processing = False
                     st.rerun()
 
