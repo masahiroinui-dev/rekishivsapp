@@ -247,7 +247,10 @@ else:
         height=250, width=700, key=f"canvas_{st.session_state.room_id}_{current_q_idx}_{st.session_state.canvas_key}"
     )
 
-    if st.button("✅ 回答を送信", type="primary", use_container_width=True):
+    # 連打防止：現在処理中の場合はボタンを無効化（グレーアウト）する
+    submit_disabled = st.session_state.is_processing
+
+    if st.button("✅ 回答を送信", type="primary", use_container_width=True, disabled=submit_disabled):
         if canvas_result.image_data is not None:
             # 同期リフレッシュの競合を防ぐフラグをセット
             st.session_state.is_processing = True
@@ -255,8 +258,7 @@ else:
                 try:
                     raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
                     
-                    # 🚀 【高速化の要】透過チャネルを白背景RGBに変換しつつ、解像度を350x125に縮小して送信サイズを1/4にする
-                    # これにより、大人数の環境でもネットワークアップロード速度とGeminiの画像認識負荷が劇的に改善します
+                    # 🚀 送信画像の軽量化
                     resized_raw = raw_img.resize((350, 125), Image.Resampling.LANCZOS)
                     img = Image.new("RGB", resized_raw.size, (255, 255, 255))
                     img.paste(resized_raw, mask=resized_raw.split()[3])
@@ -274,33 +276,26 @@ else:
                     errors_logged = []
                     retry_wait_seconds = 0
                     
-                    # 有効なすべての利用可能なモデル候補を定義
-                    target_models = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash-8b']
-                    
-                    for target_model in target_models:
-                        try:
-                            ai_response = client.models.generate_content(
-                                model=target_model,
-                                contents=[img, prompt]
-                            )
-                            if ai_response and ai_response.text:
-                                break
-                        except Exception as model_err:
-                            err_str = str(model_err)
-                            errors_logged.append(f"{target_model}: {err_str}")
-                            
-                            # 429 RESOURCE_EXHAUSTED のエラーが出た場合、待機時間(秒)をエラー文から抽出する
-                            if "429" in err_str:
-                                # "Please retry in 29.283s" などの数値を正規表現で探す
-                                match = re.search(r"Please retry in ([\d\.]+)\s*s", err_str)
-                                if match:
-                                    retry_wait_seconds = max(retry_wait_seconds, int(float(match.group(1))) + 1)
-                                else:
-                                    retry_wait_seconds = max(retry_wait_seconds, 30) # フォールバックの待機時間
-                            
-                            # 404の場合はそのモデルが非対応なだけなので、リトライせず即座に次のモデルをループ
-                            if "404" in err_str:
-                                continue
+                    # 🚀 [有料キーでの安定動作最適化]
+                    # 有料アカウントの場合、メインモデル『gemini-2.5-flash』だけで1分間に1,000回リクエスト可能です。
+                    # 一時的に429が出た場合、他モデルへの無駄なアタックをせず、クォータ判定の確認メッセージを出します。
+                    target_model = 'gemini-2.5-flash'
+                    try:
+                        ai_response = client.models.generate_content(
+                            model=target_model,
+                            contents=[img, prompt]
+                        )
+                    except Exception as model_err:
+                        err_str = str(model_err)
+                        errors_logged.append(f"{target_model}: {err_str}")
+                        
+                        # 429 RESOURCE_EXHAUSTED のエラーから制限解除時間を抽出
+                        if "429" in err_str:
+                            match = re.search(r"Please retry in ([\d\.]+)\s*s", err_str)
+                            if match:
+                                retry_wait_seconds = int(float(match.group(1))) + 1
+                            else:
+                                retry_wait_seconds = 30
                     
                     if ai_response and ai_response.text:
                         if "【正解】" in ai_response.text:
@@ -313,17 +308,26 @@ else:
                         else:
                             st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
                     else:
-                        # 全てのモデルで制限やエラーが発生した場合
+                        # 429制限が発生した場合
                         if retry_wait_seconds > 0:
-                            st.error(f"⚠️ Google APIの利用制限（1分あたりの上限数）に達しました。")
-                            # ユーザーに見えるようにリアルタイムカウントダウンメーターを表示
+                            st.error("⚠️ Google APIの利用制限（1分あたりの上限数）に達しました。")
+                            
+                            # 💡 クォータに関する詳細なガイダンス
+                            if "free_tier_requests" in str(errors_logged):
+                                st.warning("📢 【重要】APIキーがまだ無料枠として認識されています。")
+                                st.markdown("""
+                                **現在のAPIキーは有料プラン(Pay-as-you-go)になっていません。**
+                                課金設定を完了した後に、**Google AI Studioで新しいAPIキーを新規作成**し、StreamlitのSecrets設定を書き換えてください。
+                                （古いキーはアップグレード後も無料枠のまま残ることがあります。）
+                                """)
+                                
                             countdown_placeholder = st.empty()
                             for remaining_sec in range(retry_wait_seconds, 0, -1):
-                                countdown_placeholder.warning(f"⏳ 利用制限がリセットされるまで、あと **{remaining_sec}秒** お待ちください...")
+                                countdown_placeholder.warning(f"⏳ 制限が解除されるまで、あと **{remaining_sec}秒** お待ちください...")
                                 time.sleep(1)
                             countdown_placeholder.success("🔄 制限が解除されました。もう一度「回答を送信」ボタンを押してください！")
                         else:
-                            st.error("⚠️ AIに接続できませんでした。管理者にお問い合わせください。")
+                            st.error("⚠️ AIに接続できませんでした。設定をご確認ください。")
                             with st.expander("詳細なシステムエラーログ"):
                                 for err in errors_logged:
                                     st.write(f"- {err}")
@@ -333,6 +337,7 @@ else:
                 finally:
                     # 採点終了後に同期リフレッシュを再有効化
                     st.session_state.is_processing = False
+                    st.rerun()
 
     # プレイヤー画面下部にも現在の正解状況をタイムライン表示
     if rank_data:
@@ -340,7 +345,7 @@ else:
         st.markdown("#### 👤 正解者一覧")
         st.write(", ".join([f"**{row['user_id']}**" for row in rank_data]))
 
-# ⏳ 大人数接続時のデータベース過負荷を防ぐため、採点処理中（is_processing = True）はスリープ＆リフレッシュをスキップ
+# ⏳ 大人数接続時のデータベース過負荷を防ぐため、採点処理中はリフレッシュをスキップ
 if not st.session_state.is_processing:
     time.sleep(refresh_interval)
     st.rerun()
