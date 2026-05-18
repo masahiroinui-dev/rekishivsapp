@@ -37,6 +37,7 @@ st.markdown("""
     .rank-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
     .rank-table th, .rank-table td { padding: 10px; border: 1px solid #cbd5e1; text-align: center; }
     .rank-table th { background-color: #f1f5f9; }
+    .db-badge { padding: 4px 8px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -100,6 +101,20 @@ with st.sidebar:
         st.session_state.user_role = "player"
         st.session_state.room_id = st.text_input("部屋番号を入力", value=st.session_state.room_id)
 
+    st.divider()
+    # 接続確認用のミニステータス
+    if st.session_state.room_id:
+        st.markdown("**📡 データベース同期状態**")
+        try:
+            # 疎通確認テスト
+            test_res = supabase.table("rooms").select("id").eq("id", st.session_state.room_id).execute()
+            if test_res.data:
+                st.markdown("<span class='db-badge' style='background-color: #dcfce7; color: #15803d;'>🟢 接続完了（同期中）</span>", unsafe_allow_html=True)
+            else:
+                st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 ルームが見つかりません</span>", unsafe_allow_html=True)
+        except Exception as conn_err:
+            st.markdown(f"<span class='db-badge' style='background-color: #fef3c7; color: #b45309;'>🟡 エラー: {conn_err}</span>", unsafe_allow_html=True)
+
 # --- 7. メイン対戦ロジック ---
 if not st.session_state.room_id:
     st.title("⚔️ 歴史・手書き早書きバトル")
@@ -114,10 +129,10 @@ try:
         st.stop()
     room_data = room_res.data[0]
 except Exception as e:
-    st.error(f"接続エラー: {e}")
+    st.error(f"Supabaseからのルーム取得エラー: {e}")
     st.stop()
 
-current_q_idx = room_data.get("current_q_idx", 0)
+current_q_idx = int(room_data.get("current_q_idx", 0))
 if "last_q_idx" not in st.session_state:
     st.session_state.last_q_idx = current_q_idx
 
@@ -137,16 +152,28 @@ st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow
 
 # リアルタイムで正解者リストをSupabaseから取得 (誰が一番早かったか)
 rank_data = []
+db_error_message = None
 try:
-    ans_res = supabase.table("answers").select("user_id, solved_at").eq("room_id", st.session_state.room_id).eq("question_idx", current_q_idx).order("solved_at", descending=False).execute()
+    # question_idx が INT8 型なので Python から渡す値を明示的に int にキャスト
+    ans_res = supabase.table("answers")\
+        .select("user_id, solved_at")\
+        .eq("room_id", str(st.session_state.room_id))\
+        .eq("question_idx", int(current_q_idx))\
+        .order("solved_at", descending=False)\
+        .execute()
     if ans_res.data:
         rank_data = ans_res.data
 except Exception as e:
-    pass
+    db_error_message = f"正解データの取得中にデータベースエラーが発生しました: {e}"
 
 # ---- 【オーナー専用画面の表示】 ----
 if st.session_state.user_role == "owner":
     st.markdown("### 👑 オーナー管理コンソール")
+    
+    # DB取得時エラーがあれば最優先で表示
+    if db_error_message:
+        st.error(db_error_message)
+        st.info("💡 対策: Supabase側で 'answers' テーブルに対する読み取りポリシー(RLS)が設定されているか、SQL Editorの設定を確認してください。")
     
     # 1. リアルタイム回答状況
     st.markdown("#### ⏱️ 正解者リアルタイム順位表 (早い者勝ち)")
@@ -158,9 +185,9 @@ if st.session_state.user_role == "owner":
         # 順位表テーブルの作成
         table_html = "<table class='rank-table'><tr><th>順位</th><th>プレイヤー名</th><th>正解時刻</th></tr>"
         for i, row in enumerate(rank_data):
-            # 時刻を読みやすい形式に変換 (ISO文字列から時間部分を抽出)
             try:
-                time_part = row["solved_at"].split("T")[1][:8]
+                # ISO文字列からミリ秒単位までを含む時間部分を抽出 (例: 12:34:56.789)
+                time_part = row["solved_at"].split("T")[1][:12]
             except:
                 time_part = row["solved_at"]
                 
@@ -202,6 +229,10 @@ if st.session_state.user_role == "owner":
 
 # ---- 【プレイヤー専用画面の表示】 ----
 else:
+    # DB取得時エラーがあれば表示
+    if db_error_message:
+        st.error(db_error_message)
+
     # プレイヤーは手書きキャンバスと回答送信ボタンを表示
     canvas_result = st_canvas(
         stroke_width=6, stroke_color="#000000", background_color="#ffffff",
@@ -240,11 +271,13 @@ else:
                     if ai_response and ai_response.text:
                         if "正解" in ai_response.text:
                             st.success("正解です！")
-                            supabase.table("answers").insert({
-                                "room_id": st.session_state.room_id,
-                                "user_id": st.session_state.user_id,
-                                "question_idx": current_q_idx
+                            # インサート結果をキャッチして可視化
+                            insert_res = supabase.table("answers").insert({
+                                "room_id": str(st.session_state.room_id),
+                                "user_id": str(st.session_state.user_id),
+                                "question_idx": int(current_q_idx)
                             }).execute()
+                            st.info(f"正解データをデータベースに送信しました。 (ユーザー: {st.session_state.user_id})")
                         else:
                             st.error(f"残念！ (AI判定: {ai_response.text})")
                     else:
@@ -261,6 +294,6 @@ else:
         st.markdown("#### 👤 正解者一覧")
         st.write(", ".join([f"**{row['user_id']}**" for row in rank_data]))
 
-# 自動同期リフレッシュ（5秒ごと）
+# 自動同期リフレッシュ（5秒ごと。オーナー画面・プレイヤー画面を強制同期）
 time.sleep(5)
 st.rerun()
