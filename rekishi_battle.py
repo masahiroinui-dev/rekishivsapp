@@ -6,6 +6,7 @@ import random
 import time
 import os
 import json
+import re
 from google import genai
 from supabase import create_client, Client
 
@@ -271,8 +272,12 @@ else:
                     
                     ai_response = None
                     errors_logged = []
+                    retry_wait_seconds = 0
                     
-                    for target_model in ['gemini-2.5-flash', 'gemini-1.5-flash']:
+                    # 有効なすべての利用可能なモデル候補を定義
+                    target_models = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash-8b']
+                    
+                    for target_model in target_models:
                         try:
                             ai_response = client.models.generate_content(
                                 model=target_model,
@@ -282,19 +287,20 @@ else:
                                 break
                         except Exception as model_err:
                             err_str = str(model_err)
+                            errors_logged.append(f"{target_model}: {err_str}")
+                            
+                            # 429 RESOURCE_EXHAUSTED のエラーが出た場合、待機時間(秒)をエラー文から抽出する
                             if "429" in err_str:
-                                try:
-                                    time.sleep(1.0)
-                                    ai_response = client.models.generate_content(
-                                        model=target_model,
-                                        contents=[img, prompt]
-                                    )
-                                    if ai_response and ai_response.text:
-                                        break
-                                except Exception as retry_err:
-                                    errors_logged.append(f"{target_model} (retry): {retry_err}")
-                            else:
-                                errors_logged.append(f"{target_model}: {model_err}")
+                                # "Please retry in 29.283s" などの数値を正規表現で探す
+                                match = re.search(r"Please retry in ([\d\.]+)\s*s", err_str)
+                                if match:
+                                    retry_wait_seconds = max(retry_wait_seconds, int(float(match.group(1))) + 1)
+                                else:
+                                    retry_wait_seconds = max(retry_wait_seconds, 30) # フォールバックの待機時間
+                            
+                            # 404の場合はそのモデルが非対応なだけなので、リトライせず即座に次のモデルをループ
+                            if "404" in err_str:
+                                continue
                     
                     if ai_response and ai_response.text:
                         if "【正解】" in ai_response.text:
@@ -307,10 +313,20 @@ else:
                         else:
                             st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
                     else:
-                        st.error("⚠️ AIに接続できませんでした。以下を確認してください。")
-                        with st.expander("詳細なシステムエラーログ"):
-                            for err in errors_logged:
-                                st.write(f"- {err}")
+                        # 全てのモデルで制限やエラーが発生した場合
+                        if retry_wait_seconds > 0:
+                            st.error(f"⚠️ Google APIの利用制限（1分あたりの上限数）に達しました。")
+                            # ユーザーに見えるようにリアルタイムカウントダウンメーターを表示
+                            countdown_placeholder = st.empty()
+                            for remaining_sec in range(retry_wait_seconds, 0, -1):
+                                countdown_placeholder.warning(f"⏳ 利用制限がリセットされるまで、あと **{remaining_sec}秒** お待ちください...")
+                                time.sleep(1)
+                            countdown_placeholder.success("🔄 制限が解除されました。もう一度「回答を送信」ボタンを押してください！")
+                        else:
+                            st.error("⚠️ AIに接続できませんでした。管理者にお問い合わせください。")
+                            with st.expander("詳細なシステムエラーログ"):
+                                for err in errors_logged:
+                                    st.write(f"- {err}")
                             
                 except Exception as e:
                     st.error(f"採点システムエラー: {e}")
