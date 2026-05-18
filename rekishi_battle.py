@@ -9,7 +9,7 @@ import json
 from google import genai
 from supabase import create_client, Client
 
-# --- 1. アプリの基本設定 ---
+# --- 1. アプリ的基本設定 ---
 st.set_page_config(page_title="歴史・手書きリアルタイム対戦", layout="centered")
 
 # --- 2. API & データベース初期化 ---
@@ -155,11 +155,12 @@ rank_data = []
 db_error_message = None
 try:
     # question_idx が INT8 型なので Python から渡す値を明示的に int にキャスト
+    # descending=False から desc=False に修正（エラー解消箇所）
     ans_res = supabase.table("answers")\
         .select("user_id, solved_at")\
         .eq("room_id", str(st.session_state.room_id))\
         .eq("question_idx", int(current_q_idx))\
-        .order("solved_at", descending=False)\
+        .order("solved_at", desc=False)\
         .execute()
     if ans_res.data:
         rank_data = ans_res.data
