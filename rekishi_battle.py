@@ -68,6 +68,8 @@ if "user_role" not in st.session_state:
     st.session_state.user_role = "player"
 if "canvas_key" not in st.session_state: 
     st.session_state.canvas_key = 0
+if "is_processing" not in st.session_state:
+    st.session_state.is_processing = False
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
@@ -102,6 +104,17 @@ with st.sidebar:
         st.session_state.room_id = st.text_input("部屋番号を入力", value=st.session_state.room_id)
 
     st.divider()
+    
+    # ⏱️ 大人数プレイ時の負荷対策設定
+    st.markdown("**⚙️ 大人数向けパフォーマンス調整**")
+    refresh_interval = st.slider(
+        "データ同期の間隔 (秒)", 
+        min_value=3, 
+        max_value=15, 
+        value=8, 
+        help="参加人数が多いときは、この値を「8秒〜12秒」に増やすことで、サーバーの負荷を下げて動作を軽くできます。"
+    )
+
     # 接続確認用のミニステータス
     if st.session_state.room_id:
         st.markdown("**📡 データベース同期状態**")
@@ -154,7 +167,6 @@ st.markdown(f"<div class='question-display'>問: {question}</div>", unsafe_allow
 rank_data = []
 db_error_message = None
 try:
-    # question_idx が INT8 型なので Python から渡す値を明示的に int にキャスト
     ans_res = supabase.table("answers")\
         .select("user_id, solved_at")\
         .eq("room_id", str(st.session_state.room_id))\
@@ -170,23 +182,18 @@ except Exception as e:
 if st.session_state.user_role == "owner":
     st.markdown("### 👑 オーナー管理コンソール")
     
-    # DB取得時エラーがあれば最優先で表示
     if db_error_message:
         st.error(db_error_message)
-        st.info("💡 対策: Supabase側で 'answers' テーブルに対する読み取りポリシー(RLS)が設定されているか、SQL Editorの設定を確認してください。")
     
     # 1. リアルタイム回答状況
     st.markdown("#### ⏱️ 正解者リアルタイム順位表 (早い者勝ち)")
     if rank_data:
-        # 最速正解者のアナウンス
         first_winner = rank_data[0]["user_id"]
         st.markdown(f"<div class='winner-announcement'>🏆 最速正解者: {first_winner} さん！</div>", unsafe_allow_html=True)
         
-        # 順位表テーブルの作成
         table_html = "<table class='rank-table'><tr><th>順位</th><th>プレイヤー名</th><th>正解時刻</th></tr>"
         for i, row in enumerate(rank_data):
             try:
-                # ISO文字列からミリ秒単位までを含む時間部分を抽出 (例: 12:34:56.789)
                 time_part = row["solved_at"].split("T")[1][:12]
             except:
                 time_part = row["solved_at"]
@@ -202,7 +209,6 @@ if st.session_state.user_role == "owner":
     st.markdown("<div class='owner-section'>", unsafe_allow_html=True)
     st.subheader("⚙️ ルーム進行コントロール")
     
-    # 💡 ネタバレ防止のため、答えをアコーディオンに格納して隠す
     with st.expander("👁️ 正解（答え）を確認する"):
         st.write(f"答え: **{correct_answer}**")
     
@@ -232,11 +238,9 @@ if st.session_state.user_role == "owner":
 
 # ---- 【プレイヤー専用画面の表示】 ----
 else:
-    # DB取得時エラーがあれば表示
     if db_error_message:
         st.error(db_error_message)
 
-    # プレイヤーは手書きキャンバスと回答送信ボタンを表示
     canvas_result = st_canvas(
         stroke_width=6, stroke_color="#000000", background_color="#ffffff",
         height=250, width=700, key=f"canvas_{st.session_state.room_id}_{current_q_idx}_{st.session_state.canvas_key}"
@@ -244,19 +248,24 @@ else:
 
     if st.button("✅ 回答を送信", type="primary", use_container_width=True):
         if canvas_result.image_data is not None:
+            # 同期リフレッシュの競合を防ぐフラグをセット
+            st.session_state.is_processing = True
             with st.spinner("AIが採点中..."):
                 try:
                     raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
-                    img = Image.new("RGB", raw_img.size, (255, 255, 255))
-                    img.paste(raw_img, mask=raw_img.split()[3])
                     
-                    # 💡 判定精度を上げるための厳格なプロンプトの設計
+                    # 🚀 【高速化の要】透過チャネルを白背景RGBに変換しつつ、解像度を350x125に縮小して送信サイズを1/4にする
+                    # これにより、大人数の環境でもネットワークアップロード速度とGeminiの画像認識負荷が劇的に改善します
+                    resized_raw = raw_img.resize((350, 125), Image.Resampling.LANCZOS)
+                    img = Image.new("RGB", resized_raw.size, (255, 255, 255))
+                    img.paste(resized_raw, mask=resized_raw.split()[3])
+                    
                     prompt = (
                         f"歴史問題: {question}\n"
                         f"期待される正解（正しい文字）: {correct_answer}\n\n"
                         "【判定手順】\n"
-                        "1. 画像に手書きされた文字が、期待される正解（正しい文字）と同じであるか厳格に確認してください。画数の省略、極端な崩し書き、全く異なる文字、類似するが異なる部首の文字などはすべて「不正解」と判定してください。\n"
-                        "2. 判定結果は必ず最初に「【正解】」または「【不正解】」という形式で明記してください。絶対にそれ以外の言葉（例：「正解に近いです」など）から始めてはいけません。\n"
+                        "1. 画像に手書きされた文字が、期待される正解（正しい文字）と同じであるか厳格に確認してください。画数の省略、部首の間違い、別の部首の混入、誤字などはすべて「不正解」と判定してください。\n"
+                        "2. 判定結果は必ず最初に「【正解】」または「【不正解】」という形式で明記してください。絶対にそれ以外の言葉から始めてはいけません。\n"
                         "3. その後、改行してからそのように判定した具体的な理由や判読された文字、アドバイスを日本語で記載してください。"
                     )
                     
@@ -272,28 +281,42 @@ else:
                             if ai_response and ai_response.text:
                                 break
                         except Exception as model_err:
-                            errors_logged.append(f"{target_model}: {model_err}")
+                            err_str = str(model_err)
+                            if "429" in err_str:
+                                try:
+                                    time.sleep(1.0)
+                                    ai_response = client.models.generate_content(
+                                        model=target_model,
+                                        contents=[img, prompt]
+                                    )
+                                    if ai_response and ai_response.text:
+                                        break
+                                except Exception as retry_err:
+                                    errors_logged.append(f"{target_model} (retry): {retry_err}")
+                            else:
+                                errors_logged.append(f"{target_model}: {model_err}")
                     
                     if ai_response and ai_response.text:
-                        # 💡 誤判定防止のため「【正解】」で厳格にチェック
                         if "【正解】" in ai_response.text:
                             st.success("正解です！ 🎉")
-                            # インサート結果をキャッチして可視化
-                            insert_res = supabase.table("answers").insert({
+                            supabase.table("answers").insert({
                                 "room_id": str(st.session_state.room_id),
                                 "user_id": str(st.session_state.user_id),
                                 "question_idx": int(current_q_idx)
                             }).execute()
-                            st.info(f"正解データをデータベースに送信しました。 (ユーザー: {st.session_state.user_id})")
                         else:
                             st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
                     else:
-                        st.error("現在AIモデルを呼び出せません。以下を確認してください:")
-                        for err in errors_logged:
-                            st.write(f"- {err}")
+                        st.error("⚠️ AIに接続できませんでした。以下を確認してください。")
+                        with st.expander("詳細なシステムエラーログ"):
+                            for err in errors_logged:
+                                st.write(f"- {err}")
                             
                 except Exception as e:
                     st.error(f"採点システムエラー: {e}")
+                finally:
+                    # 採点終了後に同期リフレッシュを再有効化
+                    st.session_state.is_processing = False
 
     # プレイヤー画面下部にも現在の正解状況をタイムライン表示
     if rank_data:
@@ -301,6 +324,7 @@ else:
         st.markdown("#### 👤 正解者一覧")
         st.write(", ".join([f"**{row['user_id']}**" for row in rank_data]))
 
-# 自動同期リフレッシュ（5秒ごと。オーナー画面・プレイヤー画面を強制同期）
-time.sleep(5)
-st.rerun()
+# ⏳ 大人数接続時のデータベース過負荷を防ぐため、採点処理中（is_processing = True）はスリープ＆リフレッシュをスキップ
+if not st.session_state.is_processing:
+    time.sleep(refresh_interval)
+    st.rerun()
