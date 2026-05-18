@@ -250,11 +250,14 @@ else:
                     img = Image.new("RGB", raw_img.size, (255, 255, 255))
                     img.paste(raw_img, mask=raw_img.split()[3])
                     
+                    # 💡 判定精度を上げるための厳格なプロンプトの設計
                     prompt = (
                         f"歴史問題: {question}\n"
-                        f"期待される正解: {correct_answer}\n\n"
-                        "画像の手書き文字が正解かどうか判定してください。"
-                        "正解の場合は必ず『正解』という言葉を含めて回答し、不正解の場合は簡潔に理由を教えてください。"
+                        f"期待される正解（正しい文字）: {correct_answer}\n\n"
+                        "【判定手順】\n"
+                        "1. 画像に手書きされた文字が、期待される正解（正しい文字）と同じであるか厳格に確認してください。画数の省略、極端な崩し書き、全く異なる文字、類似するが異なる部首の文字などはすべて「不正解」と判定してください。\n"
+                        "2. 判定結果は必ず最初に「【正解】」または「【不正解】」という形式で明記してください。絶対にそれ以外の言葉（例：「正解に近いです」など）から始めてはいけません。\n"
+                        "3. その後、改行してからそのように判定した具体的な理由や判読された文字、アドバイスを日本語で記載してください。"
                     )
                     
                     ai_response = None
@@ -272,8 +275,9 @@ else:
                             errors_logged.append(f"{target_model}: {model_err}")
                     
                     if ai_response and ai_response.text:
-                        if "正解" in ai_response.text:
-                            st.success("正解です！")
+                        # 💡 誤判定防止のため「【正解】」で厳格にチェック
+                        if "【正解】" in ai_response.text:
+                            st.success("正解です！ 🎉")
                             # インサート結果をキャッチして可視化
                             insert_res = supabase.table("answers").insert({
                                 "room_id": str(st.session_state.room_id),
@@ -282,7 +286,7 @@ else:
                             }).execute()
                             st.info(f"正解データをデータベースに送信しました。 (ユーザー: {st.session_state.user_id})")
                         else:
-                            st.error(f"残念！ (AI判定: {ai_response.text})")
+                            st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
                     else:
                         st.error("現在AIモデルを呼び出せません。以下を確認してください:")
                         for err in errors_logged:
