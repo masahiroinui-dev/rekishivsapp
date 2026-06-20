@@ -1,40 +1,32 @@
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
 import pandas as pd
-from PIL import Image, ImageOps
 import random
 import time
 import os
 import json
-import re
-from google import genai
 from supabase import create_client, Client
 
 # --- 1. アプリ的基本設定 ---
-st.set_page_config(page_title="歴史・手書きリアルタイム対戦", layout="centered")
+st.set_page_config(page_title="歴史リアルタイム打ち込み対戦", layout="centered")
 
-# --- 2. API & データベース接続のキャッシュ化（高速化の要） ---
-# 毎回新規にクライアントを作成すると、接続オーバーヘッドで最大1秒遅延するため、セッションキャッシュに保持します。
-@st.cache_resource
-def get_gemini_client(api_key: str):
-    return genai.Client(api_key=api_key)
-
+# --- 2. データベース接続のキャッシュ化 ---
 @st.cache_resource
 def get_supabase_client(url: str, key: str):
     return create_client(url, key)
 
 try:
-    client = get_gemini_client(st.secrets["GEMINI_API_KEY"])
-    supabase = get_supabase_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    # テキスト型への移行に伴い、GEMINI_API_KEY は不要になりました（Supabaseのみ使用）
+    url: str = st.secrets["SUPABASE_URL"]
+    key: str = st.secrets["SUPABASE_KEY"]
+    supabase = get_supabase_client(url, key)
 except Exception as e:
     st.error(f"⚠️ 設定エラー: {e}")
-    st.info("Secrets に GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY が設定されているか確認してください。")
+    st.info("Secrets に SUPABASE_URL と SUPABASE_KEY が設定されているか確認してください。")
     st.stop()
 
 # --- 3. デザイン（CSS） ---
 st.markdown("""
     <style>
-    .stCanvasContainer { border: 3px solid #4a4a4a; border-radius: 12px; background-color: #ffffff; }
     .status-box { padding: 12px; border-radius: 8px; margin-bottom: 15px; text-align: center; font-weight: bold; background-color: #f0f2f6; border: 1px solid #d1d5db; font-size: 1.1rem; }
     .winner-announcement { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 10px; text-align: center; font-size: 1.6rem; margin-top: 10px; border: 2px solid #ffeeba; font-weight: bold; }
     .question-display { font-size: 1.5rem; font-weight: bold; color: #1e3a8a; padding: 18px; background: #eff6ff; border-radius: 10px; margin-bottom: 20px; border-left: 5px solid #3b82f6; }
@@ -71,10 +63,6 @@ if "room_id" not in st.session_state:
     st.session_state.room_id = ""
 if "user_role" not in st.session_state: 
     st.session_state.user_role = "player"
-if "canvas_key" not in st.session_state: 
-    st.session_state.canvas_key = 0
-if "is_processing" not in st.session_state:
-    st.session_state.is_processing = False
 
 # --- 6. サイドバー：入室・ルーム管理 ---
 with st.sidebar:
@@ -110,14 +98,14 @@ with st.sidebar:
 
     st.divider()
     
-    # ⏱️ 大人数プレイ時の負荷対策設定
-    st.markdown("**⚙️ 大人数向けパフォーマンス調整**")
+    # ⏱️ 同期リフレッシュ間隔の設定
+    st.markdown("**⚙️ 同期パフォーマンス調整**")
     refresh_interval = st.slider(
         "データ同期の間隔 (秒)", 
-        min_value=3, 
+        min_value=2, 
         max_value=15, 
-        value=15, 
-        help="参加人数が多いときは、この値を「8秒〜15秒」に増やすことで、サーバーの負荷を下げて動作を軽くできます。"
+        value=5, 
+        help="テキスト式は非常に軽量なため、基本は5秒前後でサクサク動作します。"
     )
 
     # 接続確認用のミニステータス
@@ -127,17 +115,17 @@ with st.sidebar:
             test_res = supabase.table("rooms").select("id, is_active").eq("id", st.session_state.room_id).execute()
             if test_res.data:
                 if test_res.data[0].get("is_active", True):
-                    st.markdown("<span class='db-badge' style='background-color: #dcfce7; color: #15803d;'>🟢 接続完了（同期中）</span>", unsafe_allow_html=True)
+                    st.markdown("<span class='db-badge' style='background-color: #dcfce7; color: #15803d;'>🟢 同期中</span>", unsafe_allow_html=True)
                 else:
-                    st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 終了されたルームです</span>", unsafe_allow_html=True)
+                    st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 終了されたルーム</span>", unsafe_allow_html=True)
             else:
-                st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 ルームが見つかりません</span>", unsafe_allow_html=True)
+                st.markdown("<span class='db-badge' style='background-color: #fee2e2; color: #b91c1c;'>🔴 ルームなし</span>", unsafe_allow_html=True)
         except Exception as conn_err:
             st.markdown(f"<span class='db-badge' style='background-color: #fef3c7; color: #b45309;'>🟡 エラー: {conn_err}</span>", unsafe_allow_html=True)
 
 # --- 7. メイン対戦ロジック ---
 if not st.session_state.room_id:
-    st.title("⚔️ 歴史・手書き早書きバトル")
+    st.title("⚔️ 歴史リアルタイム早押し打ち込みバトル")
     st.info("👋 サイドバーから部屋を作成するか、部屋番号を入力して対戦を開始してください。")
     st.stop()
 
@@ -166,18 +154,11 @@ except Exception as e:
     st.stop()
 
 current_q_idx = int(room_data.get("current_q_idx", 0))
-if "last_q_idx" not in st.session_state:
-    st.session_state.last_q_idx = current_q_idx
-
-# 問題が変わったらキャンバスをクリア
-if st.session_state.last_q_idx != current_q_idx:
-    st.session_state.canvas_key += 1
-    st.session_state.last_q_idx = current_q_idx
 
 current_q_idx_safe = current_q_idx % len(df)
 q_data = df.iloc[current_q_idx_safe]
 question = q_data["question"]
-correct_answer = q_data["answer"]
+correct_answer = str(q_data["answer"]).strip()
 
 # --- [ここから画面描画] ---
 st.markdown(f"<div class='status-box'>🏰 ルーム: {st.session_state.room_id} | 現在の役割: {'👑 オーナー' if st.session_state.user_role == 'owner' else '👤 プレイヤー'}</div>", unsafe_allow_html=True)
@@ -261,7 +242,7 @@ if st.session_state.user_role == "owner":
             st.success("ルームを解散しました。")
             st.rerun()
         except Exception as disband_err:
-            st.error(f"ルーム解散エラー: disband_err")
+            st.error(f"ルーム解散エラー")
             
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -270,105 +251,44 @@ else:
     if db_error_message:
         st.error(db_error_message)
 
-    canvas_result = st_canvas(
-        stroke_width=6, stroke_color="#000000", background_color="#ffffff",
-        height=250, width=700, key=f"canvas_{st.session_state.room_id}_{current_q_idx}_{st.session_state.canvas_key}"
-    )
+    # 🚀 【超高速化】手書きキャンバスの代わりにテキスト入力フォームを設置
+    # 生徒がすでにこの問題で正解しているかチェック（二重送信防止）
+    has_already_solved = any(row["user_id"] == st.session_state.user_id for row in rank_data)
 
-    submit_disabled = st.session_state.is_processing
-
-    if st.button("✅ 回答を送信", type="primary", use_container_width=True, disabled=submit_disabled):
-        if canvas_result.image_data is not None:
-            st.session_state.is_processing = True
-            with st.spinner("AIが採点中..."):
-                try:
-                    # 🚀 【劇的軽量化①】カラー画像をモノクロ（グレー）に変換し、不要な画素情報を完全カット
-                    raw_img = Image.fromarray(canvas_result.image_data.astype('uint8'))
-                    gray_img = ImageOps.grayscale(raw_img)
-                    
-                    # 🚀 【劇的軽量化②】解像度を大幅に縮小（文字のディテールを保ちながらデータサイズを最大1/20以下に削減）
-                    # これにより教室のWi-Fiの上りデータ送信時間およびGemini APIの解析準備オーバーヘッドを最小化します
-                    resized_gray = gray_img.resize((240, 90), Image.Resampling.LANCZOS)
-                    
-                    # 🚀 【劇的軽量化③】PNG圧縮用のシンプルな白黒2値RGB画像を再構成
-                    img = Image.new("RGB", resized_gray.size, (255, 255, 255))
-                    img.paste(resized_gray, mask=raw_img.split()[3].resize((240, 90)))
-                    
-                    prompt = (
-                        f"歴史問題: {question}\n"
-                        f"期待される正解（正しい文字）: {correct_answer}\n\n"
-                        "【判定手順】\n"
-                        "1. 画像に手書きされた文字が、期待される正解（正しい文字）と同じであるか厳格に確認してください。画数の省略、部首の間違い、別の部首の混入、誤字などはすべて「不正解」と判定してください。\n"
-                        "2. 判定結果は必ず最初に「【正解】」または「【不正解】」という形式で明記してください。絶対にそれ以外の言葉から始めてはいけません。\n"
-                        "3. その後、改行してからそのように判定した具体的な理由や判読された文字、アドバイスを日本語で記載してください。"
-                    )
-                    
-                    ai_response = None
-                    errors_logged = []
-                    retry_wait_seconds = 0
-                    
-                    target_model = 'gemini-2.5-flash'
+    if has_already_solved:
+        st.success("🎉 あなたはこの問題に正解済みです！オーナーが次の問題に進めるのを待っています。")
+    else:
+        # フォームを使ってEnterキー送信にも対応
+        with st.form(key=f"answer_form_{current_q_idx}", clear_on_submit=True):
+            user_input = st.text_input("ここに解答（漢字・テキスト）を入力してください", key=f"input_{current_q_idx}")
+            submit_button = st.form_submit_button(label="✅ 解答を送信", use_container_width=True)
+            
+            if submit_button and user_input:
+                # 前後の空白を取り除き、大文字小文字や全角半角のブレを簡易吸収して比較
+                processed_input = str(user_input).strip()
+                
+                # 🚀 【0.01秒の判定ロジック】AIを通さずプログラムで直接マッチング
+                if processed_input == correct_answer:
                     try:
-                        ai_response = client.models.generate_content(
-                            model=target_model,
-                            contents=[img, prompt]
-                        )
-                    except Exception as model_err:
-                        err_str = str(model_err)
-                        errors_logged.append(f"{target_model}: {err_str}")
-                        
-                        if "429" in err_str:
-                            match = re.search(r"Please retry in ([\d\.]+)\s*s", err_str)
-                            if match:
-                                retry_wait_seconds = int(float(match.group(1))) + 1
-                            else:
-                                retry_wait_seconds = 30
-                    
-                    if ai_response and ai_response.text:
-                        if "【正解】" in ai_response.text:
-                            st.success("正解です！ 🎉")
-                            supabase.table("answers").insert({
-                                "room_id": str(st.session_state.room_id),
-                                "user_id": str(st.session_state.user_id),
-                                "question_idx": int(current_q_idx)
-                            }).execute()
-                        else:
-                            st.error(f"残念！不正解です。\n\n💡 AIからのフィードバック:\n{ai_response.text.replace('【不正解】', '').strip()}")
-                    else:
-                        if retry_wait_seconds > 0:
-                            st.error("⚠️ Google APIの利用制限（1分あたりの上限数）に達しました。")
-                            
-                            if "free_tier_requests" in str(errors_logged):
-                                st.warning("📢 【重要】APIキーがまだ無料枠として認識されています。")
-                                st.markdown("""
-                                **現在のAPIキーは有料プラン(Pay-as-you-go)になっていません。**
-                                課金設定を完了した後に、**Google AI Studioで新しいAPIキーを新規作成**し、StreamlitのSecrets設定を書き換えてください。
-                                """)
-                                
-                            countdown_placeholder = st.empty()
-                            for remaining_sec in range(retry_wait_seconds, 0, -1):
-                                countdown_placeholder.warning(f"⏳ 制限が解除されるまで、あと **{remaining_sec}秒** お待ちください...")
-                                time.sleep(1)
-                            countdown_placeholder.success("🔄 制限が解除されました。もう一度「回答を送信」ボタンを押してください！")
-                        else:
-                            st.error("⚠️ AIに接続できませんでした。設定をご確認ください。")
-                            with st.expander("詳細なシステムエラーログ"):
-                                for err in errors_logged:
-                                    st.write(f"- {err}")
-                            
-                except Exception as e:
-                    st.error(f"採点システムエラー: {e}")
-                finally:
-                    st.session_state.is_processing = False
-                    st.rerun()
+                        supabase.table("answers").insert({
+                            "room_id": str(st.session_state.room_id),
+                            "user_id": str(st.session_state.user_id),
+                            "question_idx": int(current_q_idx)
+                        }).execute()
+                        st.success("正解です！ 🎉 （データ送信完了）")
+                        time.sleep(0.5)
+                        st.rerun()
+                    except Exception as db_err:
+                        st.error(f"正解データの送信中にエラーが発生しました: {db_err}")
+                else:
+                    st.error(f"❌ 不正解！ 入力された値:「{processed_input}」（もう一度入力して送信できます）")
 
     # プレイヤー画面下部にも現在の正解状況をタイムライン表示
     if rank_data:
         st.markdown(f"<div class='winner-announcement'>🏆 この問題の勝者: {rank_data[0]['user_id']} さん！</div>", unsafe_allow_html=True)
-        st.markdown("#### 👤 正解者一覧")
+        st.markdown("#### 👤 正解者一覧（早い順）")
         st.write(", ".join([f"**{row['user_id']}**" for row in rank_data]))
 
-# ⏳ 大人数接続時のデータベース過負荷を防ぐため、採点処理中はリフレッシュをスキップ
-if not st.session_state.is_processing:
-    time.sleep(refresh_interval)
-    st.rerun()
+# ⏳ テキスト打ち込み型は非常に軽量なため、データ同期の待機時間をデフォルト5秒（または設定値）に短縮
+time.sleep(refresh_interval)
+st.rerun()
